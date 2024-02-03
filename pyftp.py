@@ -43,12 +43,16 @@ class CommandLineUI(UI):
         title: str = "",
         prompt: str = "Enter your choice: "
     ) -> Choice:
+        print(title)
         for i, item in enumerate(ls, 1):
             print(f"{i}. {item}")
         while True:
             choice = input(prompt)
             try:
                 choice_int = int(choice)
+                if choice_int > len(ls) or choice_int < 1:
+                    print(f"Please enter between 1 and {len(ls)}")
+                    continue
                 return choice_int - 1
             except Exception:
                 continue
@@ -154,6 +158,42 @@ def ftp_download(ftp: FTP, args: argparse.Namespace):
     print(f"{os.getcwd()}/{filename}")
 
 
+def _upload(ftp: FTP, f: str, dest: str):
+    with open(f, "rb") as fd:
+        ftp.cwd(dest)
+        ftp.storbinary(f"STOR {os.path.basename(f)}", fd)
+
+
+def ftp_recursive_upload(ftp, f: str, dest: str):
+    if not os.path.isdir(f):
+        raise Exception("ftp_recursive_upload() must be used only for dirs")
+    dirs = [(f, dest), ]
+    while len(dirs) > 0:
+        src_dir, dest_dir = dirs.pop(0)
+        ftp.cwd(dest_dir)
+        basename = os.path.basename(src_dir)
+        ftp.mkd(basename)
+        dest_dir = os.path.join(dest_dir, basename)
+        items = os.listdir(src_dir)
+        for item in items:
+            filename = os.path.join(src_dir, item)
+            if os.path.isdir(filename):
+                dirs.append((
+                    filename,
+                    dest_dir,
+                ))
+                continue
+            _upload(ftp, filename, dest_dir)
+
+
+def ftp_upload(ftp: FTP, args: argparse.Namespace):
+    for f in args.src:
+        if os.path.isdir(f):
+            ftp_recursive_upload(ftp, f, args.dest)
+            continue
+        _upload(ftp, f, args.dest)
+
+
 parser = argparse.ArgumentParser(description="ftp client")
 parser.set_defaults(func=lambda *x: parser.print_help())
 sub_parsers = parser.add_subparsers(description="FTP commands")
@@ -163,13 +203,17 @@ ls.set_defaults(func=ftp_ls)
 download = sub_parsers.add_parser("download", help="download files/directories")
 download.add_argument("path", nargs='?')
 download.set_defaults(func=ftp_download)
+upload = sub_parsers.add_parser("upload", help="upload files/directories")
+upload.add_argument("src", nargs='+', help="source file/directory")
+upload.add_argument("dest", help="name of the destination directory where the files/directories must be uploaded")
+upload.set_defaults(func=ftp_upload)
 
 args = parser.parse_args()
-ftpconfigs = TomlFTPConfigParser("ftpconfig.toml").parse()
+ftpconfigs = TomlFTPConfigParser("test_ftpconfig.toml").parse()
 ui = CommandLineUI()
 choice = ui.display_choice_menu(
     ls=list(map(lambda x: f"{x.name} ({x.host})", ftpconfigs)),
-    title="FTP Servers",
+    title="FTP Servers:",
     prompt="Please choose FTP server: "
 )
 ftpconfig = ftpconfigs[choice]
