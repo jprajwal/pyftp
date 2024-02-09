@@ -172,23 +172,23 @@ def ftp_download(ftp: FTP, args: argparse.Namespace):
     ls = ftp.nlst()
     if filename not in ls:
         raise Exception(f"No such file/dir in FTP path: {dirname}")
-    dirs = [args.ftp_path, ]
-    pwd = os.getcwd()
-    os.chdir(args.local_path)
+    dest_dir = os.path.abspath(args.local_path)
+    dirs = [(dest_dir, args.ftp_path), ]
+    if not os.path.exists(dest_dir):
+        raise Exception(f"No such file/dir in local fs: {dest_dir}")
     while len(dirs) > 0:
-        d = dirs.pop(0)
-        filename = os.path.basename(d)
-        os.mkdir(filename)
-        os.chdir(filename)
-        ftp.cwd(d)
+        dest_dir, ftp_d = dirs.pop(0)
+        filename = os.path.basename(ftp_d)
+        dest_dir = os.path.join(dest_dir, filename)
+        os.mkdir(dest_dir)
+        ftp.cwd(ftp_d)
         for f in ftp.nlst():
             filename = os.path.join(ftp.pwd(), f)
             if not _is_file(ftp, filename):
-                dirs.append(filename)
+                dirs.append((dest_dir, filename))
                 continue
-            with open(f, "wb") as fd:
+            with open(os.path.join(dest_dir, f), "wb") as fd:
                 ftp.retrbinary(f"RETR {f}", fd.write)
-    os.chdir(pwd)
 
 
 def _upload(ftp: FTP, f: str, dest: str):
