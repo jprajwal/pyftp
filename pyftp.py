@@ -57,7 +57,6 @@ class CommandLineUI(UI):
             except Exception:
                 continue
 
-        
 
 class PasswordDecoder(ABC):
     @abstractmethod
@@ -146,16 +145,50 @@ class FileZillaFTPConfigParser(FTPConfigParser):
             )
         return servers
 
+
 def ftp_ls(ftp: FTP, args: argparse.Namespace):
     files = ftp.nlst(" ".join(args.path))
     print(files)
 
 
+def _is_file(ftp: FTP, f: str) -> bool:
+    try:
+        ftp.size(f)
+        return True
+    except Exception:
+        return False
+
+
 def ftp_download(ftp: FTP, args: argparse.Namespace):
-    filename = args.path.split("/")[-1]
-    with open(filename, "wb") as fd:
-        ftp.retrbinary(f"RETR {args.path}", fd.write)
-    print(f"{os.getcwd()}/{filename}")
+    dirname = os.path.dirname(args.ftp_path)
+    filename = os.path.basename(args.ftp_path)
+    if _is_file(ftp, args.ftp_path):
+        with open(filename, "wb") as fd:
+            ftp.retrbinary(f"RETR {args.ftp_path}", fd.write)
+        print(f"{os.getcwd()}/{filename}")
+        return
+    # maybe a directory
+    ftp.cwd(dirname)
+    ls = ftp.nlst()
+    if filename not in ls:
+        raise Exception(f"No such file/dir in FTP path: {dirname}")
+    dirs = [args.ftp_path, ]
+    pwd = os.getcwd()
+    os.chdir(args.local_path)
+    while len(dirs) > 0:
+        d = dirs.pop(0)
+        filename = os.path.basename(d)
+        os.mkdir(filename)
+        os.chdir(filename)
+        ftp.cwd(d)
+        for f in ftp.nlst():
+            filename = os.path.join(ftp.pwd(), f)
+            if not _is_file(ftp, filename):
+                dirs.append(filename)
+                continue
+            with open(f, "wb") as fd:
+                ftp.retrbinary(f"RETR {f}", fd.write)
+    os.chdir(pwd)
 
 
 def _upload(ftp: FTP, f: str, dest: str):
@@ -164,7 +197,7 @@ def _upload(ftp: FTP, f: str, dest: str):
         ftp.storbinary(f"STOR {os.path.basename(f)}", fd)
 
 
-def ftp_recursive_upload(ftp, f: str, dest: str):
+def ftp_recursive_upload(ftp: FTP, f: str, dest: str):
     if not os.path.isdir(f):
         raise Exception("ftp_recursive_upload() must be used only for dirs")
     dirs = [(f, dest), ]
@@ -197,17 +230,31 @@ def ftp_upload(ftp: FTP, args: argparse.Namespace):
 parser = argparse.ArgumentParser(description="ftp client")
 parser.set_defaults(func=lambda *x: parser.print_help())
 sub_parsers = parser.add_subparsers(description="FTP commands")
-ls = sub_parsers.add_parser("ls", help="list files/directories in specified file/directory")
+ls = sub_parsers.add_parser(
+    "ls",
+    help="list files/directories in specified file/directory"
+)
 ls.add_argument("path", nargs='*', default="/")
 ls.set_defaults(func=ftp_ls)
-download = sub_parsers.add_parser("download", help="download files/directories")
-download.add_argument("path", nargs='?')
+download = sub_parsers.add_parser(
+    "download", help="download files/directories"
+)
+download.add_argument("ftp_path")
+download.add_argument(
+    "local_path",
+    default=os.getcwd(),
+    help=("local dir where the specified ftp file must be downloaded. "
+            + "Default is current working dir")
+)
 download.set_defaults(func=ftp_download)
 upload = sub_parsers.add_parser("upload", help="upload files/directories")
 upload.add_argument("src", nargs='+', help="source file/directory")
-upload.add_argument("dest", help="name of the destination directory where the files/directories must be uploaded")
+upload.add_argument(
+    "dest",
+    help=("name of the destination directory where the files/directories "
+            + "must be uploaded")
+)
 upload.set_defaults(func=ftp_upload)
-
 args = parser.parse_args()
 ftpconfigs = TomlFTPConfigParser("test_ftpconfig.toml").parse()
 ui = CommandLineUI()
