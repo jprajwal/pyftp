@@ -2,13 +2,11 @@ import argparse
 import base64
 import os
 import sys
-import threading
 import tomllib
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from ftplib import FTP
-from queue import Empty, Queue
 from typing import Generator, TypeAlias
 
 from prompt_toolkit import HTML, print_formatted_text, prompt
@@ -17,53 +15,94 @@ from prompt_toolkit.completion.base import CompleteEvent
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import FormattedText
 
+from concurrent.futures import ThreadPoolExecutor, Future
+
 
 class FTPPathCompleter(Completer):
+    COMPLETION_PLACEHOLDER = "..."
+
     def __init__(self, ftp: FTP) -> None:
         self._ftp = ftp
         self._completions: list[str] = []
         self._pwd = ""
-        self._queue: Queue[list[str]] = Queue()
-        self._processing = threading.Event()
+        self._future: Future[list[str]] | None = None
+        self._pool: ThreadPoolExecutor | None = None
+
+    def _is_visited(self, dirname: str) -> bool:
+        return dirname == self._pwd
+
+    def _mark_as_visited(self, pwd: str) -> None:
+        self._pwd = pwd
+
+    def _get_dir_listing_async(self, dirname: str) -> tuple[bool, list[str]]:
+        if self._future is not None and self._future.done():
+            try:
+                print("hello")
+                result = self._future.result(timeout=0)
+                self._future = None
+                return True, result
+            except Exception:
+                return False, []
+
+        def get_files() -> list[str]:
+            print("get_files: start")
+            self._ftp.cwd(dirname)
+            ls = self._ftp.nlst()
+            print("get_files")
+            return ls
+
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor()
+        self._future = self._pool.submit(get_files)
+
+        return False, []
+
+    def _remove_placeholder(self, fname: str) -> str:
+        return fname.strip(self.COMPLETION_PLACEHOLDER)
+
+    def _get_completions_starting_with(self, word: str) -> list[str]:
+        return list(filter(lambda f: f.startswith(word), self._completions))
+
+    def _get_completion_replace_length(self, path: str) -> int:
+        return len(os.path.basename(path))
+
+    def _path_has_placeholder(self, path: str) -> bool:
+        return path.endswith(self.COMPLETION_PLACEHOLDER)
+
+    def _placeholder_completion(self) -> list[Completion]:
+        return [
+            Completion(self.COMPLETION_PLACEHOLDER, start_position=0),
+        ]
+
+    def _empty_completion(self) -> list[Completion]:
+        return []
 
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
     ) -> Generator[Completion, None, None]:
         path = document.text
-        basename = os.path.basename(path).strip("...")
         dirname = os.path.dirname(path)
-        if dirname != self._pwd:
+        basename = self._remove_placeholder(os.path.basename(path))
 
-            def get_files(q: Queue[list[str]]) -> None:
-                try:
-                    self._ftp.cwd(dirname)
-                    ls = self._ftp.nlst()
-                    q.put(ls)
-                except Exception:
-                    q.put([])
-
-            thread = threading.Thread(target=get_files, args=(self._queue,))
-            self._processing.set()
-            thread.start()
-            self._pwd = dirname
-        if self._processing.is_set():
-            try:
-                ls = self._queue.get(block=False)
-                self._processing.clear()
-                self._completions = ls
-            except Empty:
-                if path.endswith("..."):
-                    yield from iter([])
-                else:
-                    yield from iter([Completion("...", start_position=0), ])
-        else:
-            for f in filter(
-                lambda f: f.startswith(basename), self._completions
-            ):
-                length = (
-                    len(basename) + 3 if path.endswith("...") else len(basename)
-                )
+        def _completions(
+            completions: list[str],
+        ) -> Generator[Completion, None, None]:
+            self._completions = completions
+            for f in self._get_completions_starting_with(basename):
+                length = self._get_completion_replace_length(path)
                 yield Completion(f, start_position=length * -1)
+
+        if self._is_visited(dirname):
+            yield from _completions(self._completions)
+        else:
+            listing_ready, ls = self._get_dir_listing_async(dirname)
+            if not listing_ready and self._path_has_placeholder(path):
+                yield from iter(self._empty_completion())
+            elif not listing_ready:
+                yield from iter(self._placeholder_completion())
+            else:
+                self._mark_as_visited(dirname)
+                yield from _completions(ls)
 
 
 @dataclass(frozen=True)
@@ -398,7 +437,7 @@ def main() -> None:
 
 def test() -> None:
     ftpconfigs = TomlFTPConfigParser("test_ftpconfig.toml").parse()
-    ui = CommandLineUI()
+    ui = PromptToolkitUI()
     choice = ui.display_choice_menu(
         ls=list(map(lambda x: f"{x.name} ({x.host})", ftpconfigs)),
         title="FTP Servers:",
@@ -415,7 +454,10 @@ def test() -> None:
             complete_while_typing=False,
         )
     )
-
+    # while True:
+    #     inp = input("ftp path: ")
+    #     ls = list(map(lambda c: c.text, completer.get_completions(Document(inp), CompleteEvent())))
+    #     print(ls)
 
 if __name__ == "__main__":
     test()
