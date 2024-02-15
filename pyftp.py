@@ -2,11 +2,13 @@ import argparse
 import base64
 import os
 import sys
+import threading
 import tomllib
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from ftplib import FTP
+from queue import Empty, Queue
 from typing import Generator, TypeAlias
 
 from prompt_toolkit import HTML, print_formatted_text, prompt
@@ -19,17 +21,49 @@ from prompt_toolkit.formatted_text import FormattedText
 class FTPPathCompleter(Completer):
     def __init__(self, ftp: FTP) -> None:
         self._ftp = ftp
+        self._completions: list[str] = []
+        self._pwd = ""
+        self._queue: Queue[list[str]] = Queue()
+        self._processing = threading.Event()
 
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
     ) -> Generator[Completion, None, None]:
         path = document.text
-        basename = os.path.basename(path)
+        basename = os.path.basename(path).strip("...")
         dirname = os.path.dirname(path)
-        self._ftp.cwd(dirname)
-        ls = filter(lambda f: f.startswith(basename), self._ftp.nlst())
-        for f in ls:
-            yield Completion(f, start_position=len(basename) * -1)
+        if dirname != self._pwd:
+
+            def get_files(q: Queue[list[str]]) -> None:
+                try:
+                    self._ftp.cwd(dirname)
+                    ls = self._ftp.nlst()
+                    q.put(ls)
+                except Exception:
+                    q.put([])
+
+            thread = threading.Thread(target=get_files, args=(self._queue,))
+            self._processing.set()
+            thread.start()
+            self._pwd = dirname
+        if self._processing.is_set():
+            try:
+                ls = self._queue.get(block=False)
+                self._processing.clear()
+                self._completions = ls
+            except Empty:
+                if path.endswith("..."):
+                    yield from iter([])
+                else:
+                    yield from iter([Completion("...", start_position=0), ])
+        else:
+            for f in filter(
+                lambda f: f.startswith(basename), self._completions
+            ):
+                length = (
+                    len(basename) + 3 if path.endswith("...") else len(basename)
+                )
+                yield Completion(f, start_position=length * -1)
 
 
 @dataclass(frozen=True)
@@ -374,7 +408,13 @@ def test() -> None:
     ftp = FTP(ftpconfig.host)
     ftp.login(user=ftpconfig.username, passwd=ftpconfig.password)
     completer = FTPPathCompleter(ftp)
-    print(prompt("ftp path: ", completer=completer))
+    print(
+        prompt(
+            "ftp path: ",
+            completer=completer,
+            complete_while_typing=False,
+        )
+    )
 
 
 if __name__ == "__main__":
