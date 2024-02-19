@@ -1,10 +1,12 @@
 import argparse
 import base64
+import logging
 import os
 import sys
 import tomllib
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from ftplib import FTP
 from typing import Generator, TypeAlias
@@ -15,7 +17,19 @@ from prompt_toolkit.completion.base import CompleteEvent
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import FormattedText
 
-from concurrent.futures import ThreadPoolExecutor, Future
+
+@dataclass(frozen=True)
+class FTPConfig:
+    name: str
+    username: str
+    password: str
+    host: str
+    port: int
+
+
+class FTPConfigParser(ABC):
+    def parse(self) -> list[FTPConfig]:
+        raise NotImplementedError()
 
 
 class FTPPathCompleter(Completer):
@@ -23,45 +37,46 @@ class FTPPathCompleter(Completer):
 
     def __init__(self, ftp: FTP) -> None:
         self._ftp = ftp
-        self._completions: list[str] = []
-        self._pwd = ""
-        self._future: Future[list[str]] | None = None
-        self._pool: ThreadPoolExecutor | None = None
+        self._ftp_cache: dict[str, list[str]] = dict()
+        self._ftp_reqs: dict[str, Future[list[str]]] = dict()
+        self._pool = ThreadPoolExecutor(max_workers=1)
 
-    def _is_visited(self, dirname: str) -> bool:
-        return dirname == self._pwd
-
-    def _mark_as_visited(self, pwd: str) -> None:
-        self._pwd = pwd
-
-    def _get_dir_listing_async(self, dirname: str) -> tuple[bool, list[str]]:
-        if self._future is not None and self._future.done():
+    def _get_dir_listing(self, dirname: str) -> list[str]:
+        logging.debug(f"start:\n{self._ftp_cache=}\n{self._ftp_reqs=}")
+        def get_files(*_, **__) -> list[str]:
             try:
-                print("hello")
-                result = self._future.result(timeout=0)
-                self._future = None
-                return True, result
-            except Exception:
-                return False, []
+                ftp = self._ftp
+                ftp.cwd(dirname)
+                ls = ftp.nlst()
+                logging.debug(f"get_files: {ls}")
+                return ls
+            except Exception as exc:
+                logging.error(str(exc))
+                raise
 
-        def get_files() -> list[str]:
-            print("get_files: start")
-            self._ftp.cwd(dirname)
-            ls = self._ftp.nlst()
-            print("get_files")
+        executor = self._ftp_reqs.setdefault(
+            dirname, self._pool.submit(get_files)
+        )
+        ls = self._ftp_cache.setdefault(dirname, [])
+        if not executor.done():
+            logging.debug(f"executing:\n{self._ftp_cache=}\n{self._ftp_reqs=}")
             return ls
-
-        if self._pool is None:
-            self._pool = ThreadPoolExecutor()
-        self._future = self._pool.submit(get_files)
-
-        return False, []
+        self._ftp_reqs.pop(dirname)
+        if executor.exception() is not None:
+            ls = self._ftp_cache.pop(dirname)
+            return ls
+        if (result := executor.result()) is not None:
+            self._ftp_cache[dirname] = result
+        logging.debug(f"end:\n{self._ftp_cache=}\n{self._ftp_reqs=}")
+        return self._ftp_cache[dirname]
 
     def _remove_placeholder(self, fname: str) -> str:
         return fname.strip(self.COMPLETION_PLACEHOLDER)
 
-    def _get_completions_starting_with(self, word: str) -> list[str]:
-        return list(filter(lambda f: f.startswith(word), self._completions))
+    def _get_completions_starting_with(
+        self, word: str, ls: list[str]
+    ) -> list[str]:
+        return list(filter(lambda f: f.startswith(word), ls))
 
     def _get_completion_replace_length(self, path: str) -> int:
         return len(os.path.basename(path))
@@ -84,39 +99,15 @@ class FTPPathCompleter(Completer):
         dirname = os.path.dirname(path)
         basename = self._remove_placeholder(os.path.basename(path))
 
-        def _completions(
-            completions: list[str],
-        ) -> Generator[Completion, None, None]:
-            self._completions = completions
-            for f in self._get_completions_starting_with(basename):
+        ls = self._get_dir_listing(dirname)
+        if not ls and self._path_has_placeholder(path):
+            yield from iter(self._empty_completion())
+        elif not ls:
+            yield from iter(self._placeholder_completion())
+        else:
+            for f in self._get_completions_starting_with(basename, ls):
                 length = self._get_completion_replace_length(path)
                 yield Completion(f, start_position=length * -1)
-
-        if self._is_visited(dirname):
-            yield from _completions(self._completions)
-        else:
-            listing_ready, ls = self._get_dir_listing_async(dirname)
-            if not listing_ready and self._path_has_placeholder(path):
-                yield from iter(self._empty_completion())
-            elif not listing_ready:
-                yield from iter(self._placeholder_completion())
-            else:
-                self._mark_as_visited(dirname)
-                yield from _completions(ls)
-
-
-@dataclass(frozen=True)
-class FTPConfig:
-    name: str
-    username: str
-    password: str
-    host: str
-    port: int
-
-
-class FTPConfigParser(ABC):
-    def parse(self) -> list[FTPConfig]:
-        raise NotImplementedError()
 
 
 Choice: TypeAlias = int
@@ -388,6 +379,19 @@ def ftp_upload(ftp: FTP, args: argparse.Namespace) -> None:
         _upload(ftp, f, args.dest)
 
 
+def test(ftp: FTP, args: argparse.Namespace) -> None:
+    logging.basicConfig(filename="test_ftp.log", level=logging.DEBUG)
+    completer = FTPPathCompleter(ftp)
+    print(
+        prompt(
+            "ftp path: ",
+            completer=completer,
+            complete_while_typing=False,
+        )
+    )
+    ftp.quit()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="ftp client")
     parser.set_defaults(func=lambda *x: parser.print_help())
@@ -420,8 +424,11 @@ def main() -> None:
         ),
     )
     upload.set_defaults(func=ftp_upload)
+    t = sub_parsers.add_parser("test", help="test autocompletion")
+    t.set_defaults(func=test)
     args = parser.parse_args()
     ftpconfigs = TomlFTPConfigParser("test_ftpconfig.toml").parse()
+    # ftpconfigs = FileZillaFTPConfigParser("/home/jprajwal/onedrive/workspace/docs/FileZilla.xml").parse()
     ui = CommandLineUI()
     choice = ui.display_choice_menu(
         ls=list(map(lambda x: f"{x.name} ({x.host})", ftpconfigs)),
@@ -431,33 +438,11 @@ def main() -> None:
     ftpconfig = ftpconfigs[choice]
     ftp = FTP(ftpconfig.host)
     ftp.login(user=ftpconfig.username, passwd=ftpconfig.password)
-    args.func(ftp, args)
-    ftp.quit()
+    try:
+        args.func(ftp, args)
+    finally:
+        ftp.quit()
 
-
-def test() -> None:
-    ftpconfigs = TomlFTPConfigParser("test_ftpconfig.toml").parse()
-    ui = PromptToolkitUI()
-    choice = ui.display_choice_menu(
-        ls=list(map(lambda x: f"{x.name} ({x.host})", ftpconfigs)),
-        title="FTP Servers:",
-        prompt_str="Please choose FTP server: ",
-    )
-    ftpconfig = ftpconfigs[choice]
-    ftp = FTP(ftpconfig.host)
-    ftp.login(user=ftpconfig.username, passwd=ftpconfig.password)
-    completer = FTPPathCompleter(ftp)
-    print(
-        prompt(
-            "ftp path: ",
-            completer=completer,
-            complete_while_typing=False,
-        )
-    )
-    # while True:
-    #     inp = input("ftp path: ")
-    #     ls = list(map(lambda c: c.text, completer.get_completions(Document(inp), CompleteEvent())))
-    #     print(ls)
 
 if __name__ == "__main__":
-    test()
+    main()
