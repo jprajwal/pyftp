@@ -1,5 +1,6 @@
 import argparse
 import base64
+import json
 import logging
 import os
 import sys
@@ -7,9 +8,10 @@ import tomllib
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from contextlib import AbstractContextManager
+from dataclasses import asdict, dataclass
 from ftplib import FTP
-from typing import Generator, TypeAlias
+from typing import Generator, TypeAlias, TypedDict, cast
 
 from prompt_toolkit import HTML, print_formatted_text, prompt
 from prompt_toolkit.completion import Completer, Completion
@@ -43,6 +45,7 @@ class FTPPathCompleter(Completer):
 
     def _get_dir_listing(self, dirname: str) -> list[str]:
         logging.debug(f"start:\n{self._ftp_cache=}\n{self._ftp_reqs=}")
+
         def get_files(*_, **__) -> list[str]:
             try:
                 ftp = self._ftp
@@ -292,9 +295,32 @@ class FileZillaFTPConfigParser(FTPConfigParser):
         return servers
 
 
-def ftp_ls(ftp: FTP, args: argparse.Namespace) -> None:
-    files = ftp.nlst(" ".join(args.path))
-    print(files)
+class FTPClient(AbstractContextManager):
+    def __init__(self, ftpconfig: FTPConfig | None) -> None:
+        self._ftpconfig = ftpconfig
+        self._ftp: FTP | None = None
+
+    def __enter__(self) -> FTP:
+        if self._ftpconfig is None:
+            raise Exception("FTPClient initialized with null config")
+        ftp = FTP(self._ftpconfig.host)
+        ftp.login(
+            user=self._ftpconfig.username, passwd=self._ftpconfig.password
+        )
+        self._ftp = ftp
+        return ftp
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        logging.debug("called __exit__()")
+        if self._ftp is not None:
+            self._ftp.quit()
+        self._ftp = None
+
+
+def ftp_ls(args: argparse.Namespace) -> None:
+    with FTPClient(get_selected_ftp_config()) as ftp:
+        files = ftp.nlst(" ".join(args.path))
+        print(files)
 
 
 def _is_file(ftp: FTP, f: str) -> bool:
@@ -305,38 +331,39 @@ def _is_file(ftp: FTP, f: str) -> bool:
         return False
 
 
-def ftp_download(ftp: FTP, args: argparse.Namespace) -> None:
-    dirname = os.path.dirname(args.ftp_path)
-    filename = os.path.basename(args.ftp_path)
-    if _is_file(ftp, args.ftp_path):
-        with open(filename, "wb") as fd:
-            ftp.retrbinary(f"RETR {args.ftp_path}", fd.write)
-        print(f"{os.getcwd()}/{filename}")
-        return
-    # maybe a directory
-    ftp.cwd(dirname)
-    ls = ftp.nlst()
-    if filename not in ls:
-        raise Exception(f"No such file/dir in FTP path: {dirname}")
-    dest_dir = os.path.abspath(args.local_path)
-    dirs = [
-        (dest_dir, args.ftp_path),
-    ]
-    if not os.path.exists(dest_dir):
-        raise Exception(f"No such file/dir in local fs: {dest_dir}")
-    while len(dirs) > 0:
-        dest_dir, ftp_d = dirs.pop(0)
-        filename = os.path.basename(ftp_d)
-        dest_dir = os.path.join(dest_dir, filename)
-        os.mkdir(dest_dir)
-        ftp.cwd(ftp_d)
-        for f in ftp.nlst():
-            filename = os.path.join(ftp.pwd(), f)
-            if not _is_file(ftp, filename):
-                dirs.append((dest_dir, filename))
-                continue
-            with open(os.path.join(dest_dir, f), "wb") as fd:
-                ftp.retrbinary(f"RETR {f}", fd.write)
+def ftp_download(args: argparse.Namespace) -> None:
+    with FTPClient(get_selected_ftp_config()) as ftp:
+        dirname = os.path.dirname(args.ftp_path)
+        filename = os.path.basename(args.ftp_path)
+        if _is_file(ftp, args.ftp_path):
+            with open(filename, "wb") as fd:
+                ftp.retrbinary(f"RETR {args.ftp_path}", fd.write)
+            print(f"{os.getcwd()}/{filename}")
+            return
+        # maybe a directory
+        ftp.cwd(dirname)
+        ls = ftp.nlst()
+        if filename not in ls:
+            raise Exception(f"No such file/dir in FTP path: {dirname}")
+        dest_dir = os.path.abspath(args.local_path)
+        dirs = [
+            (dest_dir, args.ftp_path),
+        ]
+        if not os.path.exists(dest_dir):
+            raise Exception(f"No such file/dir in local fs: {dest_dir}")
+        while len(dirs) > 0:
+            dest_dir, ftp_d = dirs.pop(0)
+            filename = os.path.basename(ftp_d)
+            dest_dir = os.path.join(dest_dir, filename)
+            os.mkdir(dest_dir)
+            ftp.cwd(ftp_d)
+            for f in ftp.nlst():
+                filename = os.path.join(ftp.pwd(), f)
+                if not _is_file(ftp, filename):
+                    dirs.append((dest_dir, filename))
+                    continue
+                with open(os.path.join(dest_dir, f), "wb") as fd:
+                    ftp.retrbinary(f"RETR {f}", fd.write)
 
 
 def _upload(ftp: FTP, f: str, dest: str) -> None:
@@ -371,31 +398,108 @@ def ftp_recursive_upload(ftp: FTP, f: str, dest: str) -> None:
             _upload(ftp, filename, dest_dir)
 
 
-def ftp_upload(ftp: FTP, args: argparse.Namespace) -> None:
-    for f in args.src:
-        if os.path.isdir(f):
-            ftp_recursive_upload(ftp, f, args.dest)
-            continue
-        _upload(ftp, f, args.dest)
+def ftp_upload(args: argparse.Namespace) -> None:
+    with FTPClient(get_selected_ftp_config()) as ftp:
+        for f in args.src:
+            if os.path.isdir(f):
+                ftp_recursive_upload(ftp, f, args.dest)
+                continue
+            _upload(ftp, f, args.dest)
 
 
-def test(ftp: FTP, args: argparse.Namespace) -> None:
-    logging.basicConfig(filename="test_ftp.log", level=logging.DEBUG)
-    completer = FTPPathCompleter(ftp)
-    print(
-        prompt(
-            "ftp path: ",
-            completer=completer,
-            complete_while_typing=False,
+def test(args: argparse.Namespace) -> None:
+    with FTPClient(get_selected_ftp_config()) as ftp:
+        logging.basicConfig(filename="test_ftp.log", level=logging.DEBUG)
+        completer = FTPPathCompleter(ftp)
+        print(
+            prompt(
+                "ftp path: ",
+                completer=completer,
+                complete_while_typing=False,
+            )
         )
+
+
+class FTPConfigDict(TypedDict):
+    name: str
+    username: str
+    password: str
+    host: str
+    port: int
+
+
+class State(TypedDict):
+    selected_server: FTPConfigDict
+
+
+class StateFileManager:
+    def __init__(self, state_file: str = "") -> None:
+        self._state_file_path = state_file or os.path.expanduser(
+            "~/.var/pyftp/state_file.json"
+        )
+        state_file_dir = os.path.dirname(self._state_file_path)
+        if not os.path.exists(state_file_dir):
+            os.makedirs(state_file_dir, exist_ok=True)
+        if not os.path.exists(self._state_file_path):
+            with open(self._state_file_path, "w", encoding="utf-8") as fd:
+                json.dump({"selected_server": {}}, fd)
+
+    def get_state(self) -> State:
+        with open(self._state_file_path, "r", encoding="utf-8") as fd:
+            state = json.load(fd)
+        return state
+
+    def set_state(self, state: State) -> None:
+        with open(self._state_file_path, "w", encoding="utf-8") as fd:
+            json.dump(state, fd)
+
+
+def select_ftp_server(args: argparse.Namespace) -> None:
+    ftpconfigs = args.config_parser.parse()
+    choice = args.ui.display_choice_menu(
+        ls=list(map(lambda x: f"{x.name} ({x.host})", ftpconfigs)),
+        title="FTP Servers:",
+        prompt_str="Please choose FTP server: ",
     )
-    ftp.quit()
+    ftpconfig = ftpconfigs[choice]
+    state_manager = StateFileManager()
+    state = state_manager.get_state()
+    state["selected_server"] = cast(FTPConfigDict, asdict(ftpconfig))
+    state_manager.set_state(state)
+
+
+def get_selected_ftp_config() -> FTPConfig | None:
+    state_manager = StateFileManager()
+    state = state_manager.get_state()
+    server = state["selected_server"]
+    if len(server) == 0:
+        return None
+    return FTPConfig(
+        name=server["name"],
+        username=server["username"],
+        password=server["password"],
+        host=server["host"],
+        port=server["port"],
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ftp client")
     parser.set_defaults(func=lambda *x: parser.print_help())
     sub_parsers = parser.add_subparsers(description="FTP commands")
+    select = sub_parsers.add_parser(
+        "select",
+        help=(
+            "select the ftp server to connect to for processing subsequent"
+            + "ftp operations"
+        ),
+    )
+    select.set_defaults(
+        func=select_ftp_server,
+        config_parser=TomlFTPConfigParser("test_ftpconfig.toml"),
+        # config_parser=FileZillaFTPConfigParser("/home/jprajwal/onedrive/workspace/docs/FileZilla.xml"),
+        ui=PromptToolkitUI(),
+    )
     ls = sub_parsers.add_parser(
         "ls", help="list files/directories in specified file/directory"
     )
@@ -427,21 +531,7 @@ def main() -> None:
     t = sub_parsers.add_parser("test", help="test autocompletion")
     t.set_defaults(func=test)
     args = parser.parse_args()
-    ftpconfigs = TomlFTPConfigParser("test_ftpconfig.toml").parse()
-    # ftpconfigs = FileZillaFTPConfigParser("/home/jprajwal/onedrive/workspace/docs/FileZilla.xml").parse()
-    ui = CommandLineUI()
-    choice = ui.display_choice_menu(
-        ls=list(map(lambda x: f"{x.name} ({x.host})", ftpconfigs)),
-        title="FTP Servers:",
-        prompt_str="Please choose FTP server: ",
-    )
-    ftpconfig = ftpconfigs[choice]
-    ftp = FTP(ftpconfig.host)
-    ftp.login(user=ftpconfig.username, passwd=ftpconfig.password)
-    try:
-        args.func(ftp, args)
-    finally:
-        ftp.quit()
+    args.func(args)
 
 
 if __name__ == "__main__":
