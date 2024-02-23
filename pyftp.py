@@ -367,7 +367,11 @@ class FTPClient(AbstractContextManager):
 
 def ftp_ls(args: argparse.Namespace) -> None:
     with FTPClient(get_selected_ftp_config()) as ftp:
-        files = ftp.nlst(" ".join(args.path))
+        parser = argparse.ArgumentParser()
+        parser.add_argument("path", nargs="*", default="/")
+        inp = args.ui.prompt_user("path: ", completer=FTPPathCompleter(ftp))
+        ls_args = parser.parse_args(inp.split())
+        files = ftp.nlst(" ".join(ls_args.path))
         print(files)
 
 
@@ -381,21 +385,35 @@ def _is_file(ftp: FTP, f: str) -> bool:
 
 def ftp_download(args: argparse.Namespace) -> None:
     with FTPClient(get_selected_ftp_config()) as ftp:
-        dirname = os.path.dirname(args.ftp_path)
-        filename = os.path.basename(args.ftp_path)
-        if _is_file(ftp, args.ftp_path):
-            with open(filename, "wb") as fd:
-                ftp.retrbinary(f"RETR {args.ftp_path}", fd.write)
-            print(f"{os.getcwd()}/{filename}")
+        ftp_path_parser = argparse.ArgumentParser()
+        ftp_path_parser.add_argument("ftp_path")
+        inp = args.ui.prompt_user("ftp path: ", completer=FTPPathCompleter(ftp))
+        ftp_path_args = ftp_path_parser.parse_args(inp.split())
+        local_path_parser = argparse.ArgumentParser()
+        local_path_parser.add_argument(
+            "local_path",
+            default=os.getcwd(),
+            help=(
+                "local dir where the specified ftp file must be downloaded. "
+                + "Default is current working dir"
+            ),
+        )
+        inp = args.ui.prompt_user("local path: ", completer=PathCompleter())
+        local_path_args = local_path_parser.parse_args(inp.split())
+        dirname = os.path.dirname(ftp_path_args.ftp_path)
+        filename = os.path.basename(ftp_path_args.ftp_path)
+        dest_dir = os.path.abspath(local_path_args.local_path)
+        if _is_file(ftp, ftp_path_args.ftp_path):
+            with open(os.path.join(dest_dir, filename), "wb") as fd:
+                ftp.retrbinary(f"RETR {ftp_path_args.ftp_path}", fd.write)
             return
         # maybe a directory
         ftp.cwd(dirname)
         ls = ftp.nlst()
         if filename not in ls:
             raise Exception(f"No such file/dir in FTP path: {dirname}")
-        dest_dir = os.path.abspath(args.local_path)
         dirs = [
-            (dest_dir, args.ftp_path),
+            (dest_dir, ftp_path_args.ftp_path),
         ]
         if not os.path.exists(dest_dir):
             raise Exception(f"No such file/dir in local fs: {dest_dir}")
@@ -569,21 +587,11 @@ def main() -> None:
     ls = sub_parsers.add_parser(
         "ls", help="list files/directories in specified file/directory"
     )
-    ls.add_argument("path", nargs="*", default="/")
-    ls.set_defaults(func=ftp_ls)
+    ls.set_defaults(func=ftp_ls, ui=PromptToolkitUI())
     download = sub_parsers.add_parser(
         "download", help="download files/directories"
     )
-    download.add_argument("ftp_path")
-    download.add_argument(
-        "local_path",
-        default=os.getcwd(),
-        help=(
-            "local dir where the specified ftp file must be downloaded. "
-            + "Default is current working dir"
-        ),
-    )
-    download.set_defaults(func=ftp_download)
+    download.set_defaults(func=ftp_download, ui=PromptToolkitUI())
     upload = sub_parsers.add_parser("upload", help="upload files/directories")
     upload.set_defaults(func=ftp_upload, ui=PromptToolkitUI())
     t = sub_parsers.add_parser("test", help="test autocompletion")
