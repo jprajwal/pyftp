@@ -14,7 +14,9 @@ from ftplib import FTP
 from typing import Generator, TypeAlias, TypedDict, cast
 
 from prompt_toolkit import HTML, print_formatted_text, prompt
-from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.completion import Completer as PTKCompleter
+from prompt_toolkit.completion import Completion as PTKCompletion
+from prompt_toolkit.completion import PathCompleter as PTKPathCompleter
 from prompt_toolkit.completion.base import CompleteEvent
 from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import FormattedText
@@ -32,6 +34,24 @@ class FTPConfig:
 class FTPConfigParser(ABC):
     def parse(self) -> list[FTPConfig]:
         raise NotImplementedError()
+
+
+class Completion:
+    def __init__(self, text: str, start_position: int = 0) -> None:
+        self._text = text
+        self._position = start_position
+
+    def text(self) -> str:
+        return self._text
+
+    def start_position(self) -> int:
+        return self._position
+
+
+class Completer(ABC):
+    @abstractmethod
+    def get_completions(self, inp: str) -> list[Completion]:
+        ...
 
 
 class FTPPathCompleter(Completer):
@@ -57,9 +77,9 @@ class FTPPathCompleter(Completer):
                 logging.error(str(exc))
                 raise
 
-        executor = self._ftp_reqs.setdefault(
-            dirname, self._pool.submit(get_files)
-        )
+        if dirname not in self._ftp_reqs:
+            self._ftp_reqs[dirname] = self._pool.submit(get_files)
+        executor = self._ftp_reqs[dirname]
         ls = self._ftp_cache.setdefault(dirname, [])
         if not executor.done():
             logging.debug(f"executing:\n{self._ftp_cache=}\n{self._ftp_reqs=}")
@@ -87,30 +107,49 @@ class FTPPathCompleter(Completer):
     def _path_has_placeholder(self, path: str) -> bool:
         return path.endswith(self.COMPLETION_PLACEHOLDER)
 
-    def _placeholder_completion(self) -> list[Completion]:
-        return [
-            Completion(self.COMPLETION_PLACEHOLDER, start_position=0),
-        ]
+    def get_completions(self, inp: str) -> list[Completion]:
+        path = inp
+        dirname = os.path.dirname(path)
+        basename = self._remove_placeholder(os.path.basename(path))
+        ls = self._get_dir_listing(dirname)
+        if not ls and self._path_has_placeholder(path):
+            return []
+        elif not ls:
+            return [
+                Completion(self.COMPLETION_PLACEHOLDER, 0),
+            ]
+        else:
+            to_return = []
+            for f in self._get_completions_starting_with(basename, ls):
+                length = self._get_completion_replace_length(path)
+                to_return.append(Completion(f, length * -1))
+            return to_return
 
-    def _empty_completion(self) -> list[Completion]:
-        return []
+
+class PathCompleter(Completer):
+    def get_completions(self, inp) -> list[Completion]:
+        document = Document(inp, len(inp))
+        event = CompleteEvent(text_inserted=False, completion_requested=True)
+        completer = PTKPathCompleter()
+        completions = []
+        for c in completer.get_completions(document, event):
+            completions.append(Completion(c.text, c.start_position))
+        return completions
+
+
+class CompleterAdaptor(PTKCompleter):
+    def __init__(self, completer: Completer) -> None:
+        self._completer = completer
 
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
-    ) -> Generator[Completion, None, None]:
-        path = document.text
-        dirname = os.path.dirname(path)
-        basename = self._remove_placeholder(os.path.basename(path))
-
-        ls = self._get_dir_listing(dirname)
-        if not ls and self._path_has_placeholder(path):
-            yield from iter(self._empty_completion())
-        elif not ls:
-            yield from iter(self._placeholder_completion())
-        else:
-            for f in self._get_completions_starting_with(basename, ls):
-                length = self._get_completion_replace_length(path)
-                yield Completion(f, start_position=length * -1)
+    ) -> Generator[PTKCompletion, None, None]:
+        completions = self._completer.get_completions(document.text)
+        for c in completions:
+            yield PTKCompletion(
+                c.text(),
+                start_position=c.start_position(),
+            )
 
 
 Choice: TypeAlias = int
@@ -127,7 +166,9 @@ class UI(ABC):
         ...
 
     @abstractmethod
-    def prompt_user(self, prompt_str: str) -> str:
+    def prompt_user(
+        self, prompt_str: str, completer: Completer | None = None
+    ) -> str:
         ...
 
     @abstractmethod
@@ -191,8 +232,15 @@ class PromptToolkitUI(UI):
             except Exception:
                 continue
 
-    def prompt_user(self, prompt_str: str) -> str:
-        return prompt(prompt_str)
+    def prompt_user(
+        self, prompt_str: str, completer: Completer | None = None
+    ) -> str:
+        completer_adapter = (
+            CompleterAdaptor(completer) if completer is not None else None
+        )
+        return prompt(
+            prompt_str, completer=completer_adapter, complete_while_typing=False
+        )
 
     def print_error(self, msg: str) -> None:
         print_formatted_text(HTML(f"<ansired>{msg}</ansired>"))
@@ -399,18 +447,35 @@ def ftp_recursive_upload(ftp: FTP, f: str, dest: str) -> None:
 
 
 def ftp_upload(args: argparse.Namespace) -> None:
+    src_parser = argparse.ArgumentParser()
+    src_parser.add_argument("src", nargs="+", help="source file/directory")
+    dest_parser = argparse.ArgumentParser()
+    dest_parser.add_argument(
+        "dest",
+        help=(
+            "name of the destination directory where the files/directories "
+            + "must be uploaded"
+        ),
+    )
+    ui = cast(UI, args.ui)
+    inp = ui.prompt_user("src paths: ", completer=PathCompleter())
+    logging.debug(f"src paths entered by user: {inp}")
+    src_args = src_parser.parse_args(inp.split())
     with FTPClient(get_selected_ftp_config()) as ftp:
-        for f in args.src:
+        inp = ui.prompt_user("dest paths: ", completer=FTPPathCompleter(ftp))
+        logging.debug(f"dest paths entered by user: {inp}")
+        dst_args = dest_parser.parse_args(inp.split())
+        for f in src_args.src:
             if os.path.isdir(f):
-                ftp_recursive_upload(ftp, f, args.dest)
+                ftp_recursive_upload(ftp, f, dst_args.dest)
                 continue
-            _upload(ftp, f, args.dest)
+            _upload(ftp, f, dst_args.dest)
 
 
 def test(args: argparse.Namespace) -> None:
     with FTPClient(get_selected_ftp_config()) as ftp:
         logging.basicConfig(filename="test_ftp.log", level=logging.DEBUG)
-        completer = FTPPathCompleter(ftp)
+        completer = CompleterAdaptor(FTPPathCompleter(ftp))
         print(
             prompt(
                 "ftp path: ",
@@ -484,6 +549,7 @@ def get_selected_ftp_config() -> FTPConfig | None:
 
 
 def main() -> None:
+    logging.basicConfig(filename="test_ftp.log", level=logging.DEBUG)
     parser = argparse.ArgumentParser(description="ftp client")
     parser.set_defaults(func=lambda *x: parser.print_help())
     sub_parsers = parser.add_subparsers(description="FTP commands")
@@ -519,15 +585,7 @@ def main() -> None:
     )
     download.set_defaults(func=ftp_download)
     upload = sub_parsers.add_parser("upload", help="upload files/directories")
-    upload.add_argument("src", nargs="+", help="source file/directory")
-    upload.add_argument(
-        "dest",
-        help=(
-            "name of the destination directory where the files/directories "
-            + "must be uploaded"
-        ),
-    )
-    upload.set_defaults(func=ftp_upload)
+    upload.set_defaults(func=ftp_upload, ui=PromptToolkitUI())
     t = sub_parsers.add_parser("test", help="test autocompletion")
     t.set_defaults(func=test)
     args = parser.parse_args()
