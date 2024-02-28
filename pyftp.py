@@ -122,7 +122,9 @@ class FTPPathCompleter(Completer):
             to_return = []
             for f in self._get_completions_starting_with(basename, ls):
                 length = self._get_completion_replace_length(path)
-                to_return.append(Completion(f, length * -1))
+                to_return.append(
+                    Completion(f.replace(r" ", r"\ "), length * -1)
+                )
             return to_return
 
 
@@ -133,7 +135,9 @@ class PathCompleter(Completer):
         completer = PTKPathCompleter()
         completions = []
         for c in completer.get_completions(document, event):
-            completions.append(Completion(c.text, c.start_position))
+            completions.append(
+                Completion(c.text.replace(r" ", r"\ "), c.start_position)
+            )
         return completions
 
 
@@ -365,12 +369,33 @@ class FTPClient(AbstractContextManager):
         self._ftp = None
 
 
+def split(s: str) -> list[str]:
+    ls = []
+    cur: list[str] = []
+    for c in s:
+        if c == " ":
+            if cur[-1] == "\\":
+                cur.pop(-1)
+                cur.append(c)
+            else:
+                ns = "".join(cur)
+                if ns:
+                    ls.append(ns)
+                    cur = []
+        else:
+            cur.append(c)
+    ls.append("".join(cur))
+    logging.debug(f"split {ls=}")
+    return ls
+
+
+
 def ftp_ls(args: argparse.Namespace) -> None:
     with FTPClient(get_selected_ftp_config()) as ftp:
         parser = argparse.ArgumentParser()
         parser.add_argument("path", nargs="*", default="/")
         inp = args.ui.prompt_user("path: ", completer=FTPPathCompleter(ftp))
-        ls_args = parser.parse_args(inp.split())
+        ls_args = parser.parse_args(split(inp))
         files = ftp.nlst(" ".join(ls_args.path))
         print(files)
 
@@ -388,7 +413,7 @@ def ftp_download(args: argparse.Namespace) -> None:
         ftp_path_parser = argparse.ArgumentParser()
         ftp_path_parser.add_argument("ftp_path")
         inp = args.ui.prompt_user("ftp path: ", completer=FTPPathCompleter(ftp))
-        ftp_path_args = ftp_path_parser.parse_args(inp.split())
+        ftp_path_args = ftp_path_parser.parse_args(split(inp))
         local_path_parser = argparse.ArgumentParser()
         local_path_parser.add_argument(
             "local_path",
@@ -399,7 +424,7 @@ def ftp_download(args: argparse.Namespace) -> None:
             ),
         )
         inp = args.ui.prompt_user("local path: ", completer=PathCompleter())
-        local_path_args = local_path_parser.parse_args(inp.split())
+        local_path_args = local_path_parser.parse_args(split(inp))
         dirname = os.path.dirname(ftp_path_args.ftp_path)
         filename = os.path.basename(ftp_path_args.ftp_path)
         dest_dir = os.path.abspath(local_path_args.local_path)
@@ -478,11 +503,11 @@ def ftp_upload(args: argparse.Namespace) -> None:
     ui = cast(UI, args.ui)
     inp = ui.prompt_user("src paths: ", completer=PathCompleter())
     logging.debug(f"src paths entered by user: {inp}")
-    src_args = src_parser.parse_args(inp.split())
+    src_args = src_parser.parse_args(split(inp))
     with FTPClient(get_selected_ftp_config()) as ftp:
         inp = ui.prompt_user("dest paths: ", completer=FTPPathCompleter(ftp))
         logging.debug(f"dest paths entered by user: {inp}")
-        dst_args = dest_parser.parse_args(inp.split())
+        dst_args = dest_parser.parse_args(split(inp))
         for f in src_args.src:
             if os.path.isdir(f):
                 ftp_recursive_upload(ftp, f, dst_args.dest)
