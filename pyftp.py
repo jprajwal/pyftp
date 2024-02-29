@@ -389,7 +389,6 @@ def split(s: str) -> list[str]:
     return ls
 
 
-
 def ftp_ls(args: argparse.Namespace) -> None:
     with FTPClient(get_selected_ftp_config()) as ftp:
         parser = argparse.ArgumentParser()
@@ -591,6 +590,25 @@ def get_selected_ftp_config() -> FTPConfig | None:
     )
 
 
+def ftp_mkdir(args: argparse.Namespace) -> None:
+    with FTPClient(get_selected_ftp_config()) as ftp:
+        mkdir_parser = argparse.ArgumentParser()
+        mkdir_parser.add_argument("dir", help="ftp dir to recursively create")
+        inp = args.ui.prompt_user("dir: ", completer=FTPPathCompleter(ftp))
+        args = mkdir_parser.parse_args(split(inp))
+        dirs = os.path.split(args.dir)
+        for d in dirs:
+            if d == "/":
+                continue
+            new_dir = os.path.join(ftp.pwd(), d)
+            try:
+                ftp.cwd(new_dir)
+            except Exception as exc:
+                logging.error(str(exc))
+                ftp.mkd(d)
+                ftp.cwd(new_dir)
+
+
 def main() -> None:
     logging.basicConfig(filename="test_ftp.log", level=logging.DEBUG)
     parser = argparse.ArgumentParser(description="ftp client")
@@ -621,6 +639,10 @@ def main() -> None:
     upload.set_defaults(func=ftp_upload, ui=PromptToolkitUI())
     t = sub_parsers.add_parser("test", help="test autocompletion")
     t.set_defaults(func=test)
+    mkdir = sub_parsers.add_parser(
+        "mkdir", help="recursively create specified dirs in ftp"
+    )
+    mkdir.set_defaults(func=ftp_mkdir, ui=PromptToolkitUI())
     args = parser.parse_args()
     args.func(args)
 
